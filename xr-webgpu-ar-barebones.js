@@ -1,241 +1,419 @@
-const logEl = document.getElementById('log');
-const statusEl = document.getElementById('status');
-const btn = document.getElementById('start-ar');
-function log(...a){ logEl.textContent += a.join(' ') + '\n'; }
+ // Because we are not using the 'secondary-views' feature we can be sure
+      // that WebXR will never provide more than two views.
+      const MAX_VIEWS = 2;
+      // We have two matrices per view, which is only 32 floats, but we're going
+      // to allocate 64 of them because uniform buffers bindings must be aligned
+      // to 256-bytes.
+      const UNIFORM_FLOATS_PER_VIEW = 64;
 
-async function start(){
-  try {
-    if (!('xr' in navigator)) { log('WebXR unsupported'); return; }
-    if (!('gpu' in navigator)) { log('WebGPU unsupported'); return; }
+      // A simple shader that draws a single triangle
+      const SHADER_SRC = `
+        struct Camera {
+          projection: mat4x4f,
+          view: mat4x4f,
+        }
+        @group(0) @binding(0) var<uniform> camera: Camera;
 
-    const arOk = await navigator.xr.isSessionSupported('immersive-ar');
-    if (!arOk) { log('immersive-ar not supported'); return; }
+        struct VertexOut {
+          @builtin(position) pos: vec4f,
+          @location(0) color: vec4f,
+        }
 
-    const adapter = await navigator.gpu.requestAdapter();
-    if (!adapter) { log('No GPU adapter'); return; }
-    const device = await adapter.requestDevice();
-    log('GPU device acquired');
+        @vertex
+        fn vertexMain(@builtin(vertex_index) vert_index: u32,
+                      @builtin(instance_index) instance: u32) -> VertexOut {
+          var pos = array<vec4f, 3>(
+            vec4f(0.0, 0.25, -0.5, 1),
+            vec4f(-0.25, -0.25, -0.5, 1),
+            vec4f(0.25, -0.25, -0.5, 1)
+          );
 
-    // Require webgpu+layers to maximize chances of primary layer exposure; add hit-test/anchors optionally
-    let session;
-    try {
-      session = await navigator.xr.requestSession('immersive-ar', { requiredFeatures:['webgpu','layers'], optionalFeatures:['hit-test','anchors'] });
-      statusEl.textContent = 'Status: AR session started (webgpu+layers)';
-    } catch (e) {
-      log('requestSession failed:', e.message || e);
-      return;
-    }
+          var color = array<vec4f, 3>(
+            vec4f(1, 0, 0, 1),
+            vec4f(0, 1, 0, 1),
+            vec4f(0, 0, 1, 1)
+          );
 
-    // Do not explicitly create a WebXR+WebGPU layer. Rely on UA-provided implicit primary layer
-    const getPrimaryLayer = () => {
-      const ls = session.renderState && session.renderState.layers;
-      return (ls && ls.length > 0) ? ls[0] : null;
-    };
-    let layer = getPrimaryLayer();
-    if (!layer) {
-      log('No implicit XRWebGPU layer yet; will retry inside frame loop');
-      statusEl.textContent = 'Status: waiting implicit WebGPU layer';
-    }
+          // Give each instance a small offset to help with the sense of depth.
+          let instancePos = pos[vert_index] + vec4f(0, 0, f32(instance) * -0.1, 0);
+          let posOut = camera.projection * camera.view * instancePos;
 
-    // Hit-test setup
-    const viewerSpace = await session.requestReferenceSpace('viewer');
-    const hitSource = await session.requestHitTestSource({ space: viewerSpace }).catch(()=>null);
-    const refSpace = await session.requestReferenceSpace('local');
-    const anchors = [];
-    let pendingHitForAnchor = null;
-    session.addEventListener('select', async () => {
-      if (pendingHitForAnchor && pendingHitForAnchor.createAnchor) {
-        try {
-          const a = await pendingHitForAnchor.createAnchor(refSpace);
-          if (a) anchors.push(a);
-        } catch {}
+          return VertexOut(posOut, color[vert_index]);
+        }
+
+        @fragment
+        fn fragmentMain(in: VertexOut) -> @location(0) vec4f {
+          return in.color;
+        }
+      `;
+
+      // XR globals.
+      let xrButton = document.getElementById('xr-button');
+      let xrSession = null;
+      let xrRefSpace = null;
+
+      // WebGPU scene globals.
+      let gpuDevice = null;
+      let gpuContext = null;
+      let gpuUniformBuffer = null;
+      let gpuUniformArray = new Float32Array(UNIFORM_FLOATS_PER_VIEW * MAX_VIEWS);
+      let gpuBindGroupLayout = null;
+      let gpuBindGroups = [];
+      let gpuModule = null;
+      let gpuPipeline = null;
+      let gpuDepthTexture = null;
+      let colorFormat = null;
+      let depthStencilFormat = 'depth24plus';
+
+
+      // WebXR/WebGPU interop globals.
+      let xrGpuBinding = null;
+      let projectionLayer = null;
+
+      // Generate a projection matrix, borrowed from gl-matrix.
+      function perspectiveZO(out, fovy, aspect, near, far = Infinity) {
+        const f = 1.0 / Math.tan(fovy / 2);
+        out[0] = f / aspect;
+        out[1] = 0;
+        out[2] = 0;
+        out[3] = 0;
+        out[4] = 0;
+        out[5] = f;
+        out[6] = 0;
+        out[7] = 0;
+        out[8] = 0;
+        out[9] = 0;
+        out[11] = -1;
+        out[12] = 0;
+        out[13] = 0;
+        out[15] = 0;
+        if (far != null && far !== Infinity) {
+          const nf = 1 / (near - far);
+          out[10] = far * nf;
+          out[14] = far * near * nf;
+        } else {
+          out[10] = -1;
+          out[14] = -near;
+        }
+        return out;
       }
-    });
 
-    // Pipelines: ring (fullscreen) + triangle (overlay at center)
-    const format = navigator.gpu.getPreferredCanvasFormat();
-    const ringShader = device.createShaderModule({ code: `
-      struct Uniforms { center: vec2f, pad: vec2f };
-      @group(0) @binding(0) var<uniform> u: Uniforms;
-      @vertex fn vs(@builtin(vertex_index) vid:u32) -> @builtin(position) vec4f {
-        var pos = array<vec2f,3>(vec2f(-1.0,-1.0), vec2f(3.0,-1.0), vec2f(-1.0,3.0));
-        return vec4f(pos[vid], 0.0, 1.0);
-      }
-      @fragment fn fs(@builtin(position) p:vec4f) -> @location(0) vec4f {
-        let res = vec2f(1.0,1.0);
-        let uv = p.xy / res;
-        let c = u.center; // 0..1
-        let d = distance(uv, c);
-        let ring = smoothstep(0.01, 0.0, abs(d-0.08));
-        return vec4f(0.0,1.0,0.6, ring);
-      }
-    `});
-    const triShader = device.createShaderModule({ code: `
-      struct Uniforms { center: vec2f, pad: vec2f };
-      @group(0) @binding(0) var<uniform> u: Uniforms;
-      @vertex fn vs(@builtin(vertex_index) vid:u32) -> @builtin(position) vec4f {
-        // small triangle around center in clip space
-        let c = vec2f(u.center*2.0 - vec2f(1.0));
-        var verts = array<vec2f,3>(vec2f(-0.05,-0.05), vec2f(0.06,-0.05), vec2f(-0.05,0.08));
-        let v = verts[vid] + c;
-        return vec4f(v, 0.0, 1.0);
-      }
-      @fragment fn fs() -> @location(0) vec4f { return vec4f(1.0,0.8,0.2,1.0); }
-    `});
-    const uBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-    const bindLayout = device.createBindGroupLayout({ entries:[{ binding:0, visibility: GPUShaderStage.FRAGMENT | GPUShaderStage.VERTEX, buffer:{} }]});
-    const ringPipeline = device.createRenderPipeline({
-      layout: device.createPipelineLayout({ bindGroupLayouts:[bindLayout] }),
-      vertex:{ module: ringShader, entryPoint:'vs' },
-      fragment:{ module: ringShader, entryPoint:'fs', targets:[{ format, blend:{ color:{ srcFactor:'src-alpha', dstFactor:'one-minus-src-alpha' }, alpha:{ srcFactor:'one', dstFactor:'one-minus-src-alpha' } } }] },
-      primitive:{ topology:'triangle-list' }
-    });
-    const triPipeline = device.createRenderPipeline({
-      layout: device.createPipelineLayout({ bindGroupLayouts:[bindLayout] }),
-      vertex:{ module: triShader, entryPoint:'vs' },
-      fragment:{ module: triShader, entryPoint:'fs', targets:[{ format }] },
-      primitive:{ topology:'triangle-list' }
-    });
-    const bindGroup = device.createBindGroup({ layout: bindLayout, entries:[{ binding:0, resource:{ buffer: uBuf } }]});
+      // Checks to see if WebXR and WebGPU is available and, if so, requests an
+      // tests to ensure it supports the desired session type.
+      async function initXR() {
+        // Is WebXR, WebGPU, and WebXR/WebGPU interop available on this UA?
+        if (!navigator.xr) {
+          xrButton.textContent = 'WebXR not supported';
+          return;
+        }
 
-    function projectToUV(hitPoseMat, view){
-      // Compute NDC from hit pose for this view
-      // matrices are column-major Float32Array length 16
-      function matMul(a,b){
-        var o = new Float32Array(16);
-        for (var i=0;i<4;i++) for (var j=0;j<4;j++){ o[j*4+i]= a[i]*b[j*4] + a[i+4]*b[j*4+1] + a[i+8]*b[j*4+2] + a[i+12]*b[j*4+3]; }
-        return o;
-      }
-      function matInv(m){
-        // minimal inverse via gl-matrix-like (not robust, but OK for view)
-        const a = m; const inv = new Float32Array(16);
-        const b00 = a[0]*a[5]-a[1]*a[4]; const b01 = a[0]*a[6]-a[2]*a[4]; const b02 = a[0]*a[7]-a[3]*a[4];
-        const b03 = a[1]*a[6]-a[2]*a[5]; const b04 = a[1]*a[7]-a[3]*a[5]; const b05 = a[2]*a[7]-a[3]*a[6];
-        const b06 = a[8]*a[13]-a[9]*a[12]; const b07 = a[8]*a[14]-a[10]*a[12]; const b08 = a[8]*a[15]-a[11]*a[12];
-        const b09 = a[9]*a[14]-a[10]*a[13]; const b10 = a[9]*a[15]-a[11]*a[13]; const b11 = a[10]*a[15]-a[11]*a[14];
-        let det = b00*b11 - b01*b10 + b02*b09 + b03*b08 - b04*b07 + b05*b06; if (!det) return null; det = 1.0/det;
-        inv[0] = ( a[5]*b11 - a[6]*b10 + a[7]*b09)*det;
-        inv[1] = (-a[1]*b11 + a[2]*b10 - a[3]*b09)*det;
-        inv[2] = ( a[13]*b05 - a[14]*b04 + a[15]*b03)*det;
-        inv[3] = (-a[9]*b05 + a[10]*b04 - a[11]*b03)*det;
-        inv[4] = (-a[4]*b11 + a[6]*b08 - a[7]*b07)*det;
-        inv[5] = ( a[0]*b11 - a[2]*b08 + a[3]*b07)*det;
-        inv[6] = (-a[12]*b05 + a[14]*b02 - a[15]*b01)*det;
-        inv[7] = ( a[8]*b05 - a[10]*b02 + a[11]*b01)*det;
-        inv[8] = ( a[4]*b10 - a[5]*b08 + a[7]*b06)*det;
-        inv[9] = (-a[0]*b10 + a[1]*b08 - a[3]*b06)*det;
-        inv[10]= ( a[12]*b04 - a[13]*b02 + a[15]*b00)*det;
-        inv[11]= (-a[8]*b04 + a[9]*b02 - a[11]*b00)*det;
-        inv[12]= (-a[4]*b09 + a[5]*b07 - a[6]*b06)*det;
-        inv[13]= ( a[0]*b09 - a[1]*b07 + a[2]*b06)*det;
-        inv[14]= (-a[12]*b03 + a[13]*b01 - a[14]*b00)*det;
-        inv[15]= ( a[8]*b03 - a[9]*b01 + a[10]*b00)*det;
-        return inv;
-      }
-      const viewInv = matInv(view.transform.matrix);
-      if (!viewInv) return null;
-      const vp = matMul(view.projectionMatrix, viewInv);
-      const p = new Float32Array([hitPoseMat[12], hitPoseMat[13], hitPoseMat[14], 1.0]);
-      const x = vp[0]*p[0]+vp[4]*p[1]+vp[8]*p[2]+vp[12]*p[3];
-      const y = vp[1]*p[0]+vp[5]*p[1]+vp[9]*p[2]+vp[13]*p[3];
-      const w = vp[3]*p[0]+vp[7]*p[1]+vp[11]*p[2]+vp[15]*p[3];
-      if (w === 0.0) return null;
-      const ndc = [x/w, y/w];
-      return [0.5*ndc[0]+0.5, 0.5*-ndc[1]+0.5];
-    }
+        if (!navigator.gpu) {
+          xrButton.textContent = 'WebGPU not supported';
+          return;
+        }
 
-    const render = (t, frame) => {
-      const pose = frame.getViewerPose(refSpace);
-      if (!pose) { session.requestAnimationFrame(render); return; }
-      try {
-        if (!layer) {
-          // Try to pick up implicit primary layer
-          layer = getPrimaryLayer();
-          if (!layer) {
-            // As a fallback, if constructors are exposed, create a layer and set renderState.layers
-            const Ctor = globalThis.XRWebGPUTieredLayer || globalThis.XRWebGPULayer;
-            if (Ctor) {
-              try {
-                layer = new Ctor(session, device);
-                if (layer) {
-                  await session.updateRenderState({ layers: [layer] });
+        if (!('XRGPUBinding' in window)) {
+          xrButton.textContent = 'WebXR/WebGPU interop not supported';
+          return;
+        }
+
+        // If the UA allows creation of immersive AR sessions enable the
+        // target of the 'Enter XR' button.
+        const supported = await navigator.xr.isSessionSupported('immersive-ar');
+        if (!supported) {
+          xrButton.textContent = 'Immersive AR not supported';
+          return;
+        }
+
+        // Updates the button to start an XR session when clicked.
+        xrButton.addEventListener('click', onButtonClicked);
+        xrButton.textContent = 'Enter AR';
+        xrButton.disabled = false;
+
+        await initWebGPU();
+        requestAnimationFrame(onFrame);
+      }
+
+      // Initializes WebGPU resources
+      async function initWebGPU() {
+        if (!gpuDevice) {
+          // Create a WebGPU adapter and device to render with, initialized to be
+          // compatible with the XRDisplay we're presenting to. Note that a canvas
+          // is not necessary if we are only rendering to the XR device.
+          const adapter = await navigator.gpu.requestAdapter({
+            xrCompatible: true
+          });
+          gpuDevice = await adapter.requestDevice();
+          colorFormat = navigator.gpu.getPreferredCanvasFormat();
+
+          gpuContext = webgpu_canvas.getContext('webgpu');
+          gpuContext.configure({
+            format: colorFormat,
+            device: gpuDevice,
+          });
+
+          // A depth texture to use when not in an immersive session.
+          gpuDepthTexture = gpuDevice.createTexture({
+            size: { width: webgpu_canvas.width, height: webgpu_canvas.height },
+            format: depthStencilFormat,
+            usage: GPUTextureUsage.RENDER_ATTACHMENT,
+          });
+
+          // Allocate a uniform buffer with enough space for two uniforms per-view
+          gpuUniformBuffer = gpuDevice.createBuffer({
+            size: Float32Array.BYTES_PER_ELEMENT * UNIFORM_FLOATS_PER_VIEW * MAX_VIEWS,
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+          });
+
+          // Set the uniform buffer to contain valid matrices initially so
+          // that we can see something.
+          let mat = [
+            1, 0, 0, 0,
+            0, 1, 0, 0,
+            0, 0, 1, 0,
+            0, 0, 0, 1
+          ];
+          gpuUniformArray.set(mat, 16);
+
+          perspectiveZO(mat, Math.PI * 0.5, webgpu_canvas.offsetWidth / webgpu_canvas.offsetHeight, 0.1);
+          gpuUniformArray.set(mat, 0);
+
+          gpuDevice.queue.writeBuffer(gpuUniformBuffer, 0, gpuUniformArray);
+
+          // Create a bind group layout for the uniforms
+          gpuBindGroupLayout = gpuDevice.createBindGroupLayout({
+            entries: [{
+              binding: 0,
+              visibility: GPUShaderStage.VERTEX,
+              buffer: {},
+            }]
+          });
+
+          // Create a bind group for each potential view
+          for (let i = 0; i < MAX_VIEWS; ++i) {
+            gpuBindGroups.push(gpuDevice.createBindGroup({
+              layout: gpuBindGroupLayout,
+              entries: [{
+                binding: 0,
+                resource: {
+                  buffer: gpuUniformBuffer,
+                  offset: Float32Array.BYTES_PER_ELEMENT * UNIFORM_FLOATS_PER_VIEW * i
                 }
-              } catch {}
-            }
+              }]
+            }));
           }
-          if (layer) statusEl.textContent = 'Status: implicit WebGPU layer acquired';
-        }
-        if (layer && (layer.getViewSubImage || layer.getViewTexture)) {
-          const encoder = device.createCommandEncoder();
-          for (const view of pose.views) {
-            let colorView;
-            // Official sample style uses getViewSubImage(view)
-            if (typeof layer.getViewSubImage === 'function') {
-              const sub = layer.getViewSubImage(view);
-              if (!sub || !sub.colorTexture) continue;
-              colorView = sub.colorTexture.createView();
-            } else if (typeof layer.getViewTexture === 'function') {
-              const tex = layer.getViewTexture(view);
-              if (!tex) continue;
-              colorView = tex.createView();
-            } else {
-              continue;
-            }
-            // Hit-test center (per view, use first hit)
-            let center = null;
-            if (hitSource) {
-              const hits = frame.getHitTestResults(hitSource);
-              if (hits.length > 0) {
-                const hitPose = hits[0].getPose(refSpace);
-                if (hitPose) center = projectToUV(hitPose.transform.matrix, view);
-                pendingHitForAnchor = hits[0];
-              }
-            }
-            // Default center if none
-            const c = center || [0.5, 0.6];
-            const data = new Float32Array([c[0], c[1], 0, 0]);
-            device.queue.writeBuffer(uBuf, 0, data.buffer, 0, data.byteLength);
 
-            const pass = encoder.beginRenderPass({
-              colorAttachments: [{ view: colorView, loadOp: 'clear', storeOp: 'store', clearValue: { r: 0, g: 0, b: 0, a: 0 } }]
-            });
-            // ring
-            pass.setPipeline(ringPipeline);
-            pass.setBindGroup(0, bindGroup);
-            pass.draw(3);
-            // triangle
-            pass.setPipeline(triPipeline);
-            pass.setBindGroup(0, bindGroup);
-            pass.draw(3);
-            // render anchored triangles
-            if (anchors.length > 0) {
-              for (const a of anchors) {
-                const as = a.anchorSpace || a; // UA differences
-                const ap = frame.getPose(as, refSpace);
-                if (!ap) continue;
-                const uv = projectToUV(ap.transform.matrix, view);
-                if (!uv) continue;
-                const d2 = new Float32Array([uv[0], uv[1], 0, 0]);
-                device.queue.writeBuffer(uBuf, 0, d2.buffer, 0, d2.byteLength);
-                pass.setPipeline(triPipeline);
-                pass.setBindGroup(0, bindGroup);
-                pass.draw(3);
-              }
-            }
-            pass.end();
-          }
-          device.queue.submit([encoder.finish()]);
+          gpuModule = gpuDevice.createShaderModule({ code: SHADER_SRC });
         }
-      } catch (e) {
-        // likely unsupported in this build
+
+        gpuPipeline = gpuDevice.createRenderPipeline({
+          layout: gpuDevice.createPipelineLayout({ bindGroupLayouts: [ gpuBindGroupLayout ]}),
+          vertex: {
+            module: gpuModule,
+            entryPoint: 'vertexMain',
+          },
+          depthStencil: {
+            format: depthStencilFormat,
+            depthWriteEnabled: true,
+            depthCompare: 'less-equal',
+          },
+          fragment: {
+            module: gpuModule,
+            entryPoint: 'fragmentMain',
+            targets: [{
+              format: colorFormat,
+            }]
+          }
+        });
       }
-      session.requestAnimationFrame(render);
-    };
-    session.requestAnimationFrame(render);
 
-  } catch (e) {
-    log('Error:', e.message || e);
-  }
-}
+      // Called when the user clicks the button to enter XR. If we don't have a
+      // session we'll request one, and if we do have a session we'll end it.
+      async function onButtonClicked() {
+        if (!xrSession) {
+          navigator.xr.requestSession('immersive-ar', {
+            requiredFeatures: ['webgpu'],
+          }).then(onSessionStarted);
+        } else {
+          xrSession.end();
+        }
+      }
 
-btn.addEventListener('click', start);
+      // Called when we've successfully acquired a XRSession. In response we
+      // will set up the necessary session state and kick off the frame loop.
+      async function onSessionStarted(session) {
+        xrSession = session;
+        xrButton.textContent = 'Exit AR';
+
+        // Listen for the sessions 'end' event so we can respond if the user
+        // or UA ends the session for any reason.
+        session.addEventListener('end', onSessionEnded);
+
+        // Create the WebXR/WebGPU binding, and with it create a projection
+        // layer to render to.
+        xrGpuBinding = new XRGPUBinding(xrSession, gpuDevice);
+
+        // If the preferred color format doesn't match what we've been rendering
+        // with so far, rebuild the pipeline
+        if (colorFormat != xrGpuBinding.getPreferredColorFormat()) {
+          colorFormat = xrGpuBinding.getPreferredColorFormat();
+          await initWebGPU();
+        }
+
+        projectionLayer = xrGpuBinding.createProjectionLayer({
+          colorFormat,
+          depthStencilFormat,
+        });
+
+        // Set the session's layers to display the projection layer. This allows
+        // any content rendered to the layer to be displayed on the XR device.
+        session.updateRenderState({ layers: [projectionLayer] });
+
+        // Get a reference space, which is required for querying poses. In this
+        // case an 'local' reference space means that all poses will be relative
+        // to the location where the XR device was first detected.
+        session.requestReferenceSpace('local').then((refSpace) => {
+          xrRefSpace = refSpace;
+
+          // Inform the session that we're ready to begin drawing.
+          session.requestAnimationFrame(onXRFrame);
+        });
+      }
+
+      // Called either when the user has explicitly ended the session by calling
+      // session.end() or when the UA has ended the session for any reason.
+      // At this point the session object is no longer usable and should be
+      // discarded.
+      async function onSessionEnded(event) {
+        xrSession = null;
+        xrGpuBinding = null;
+        xrButton.textContent = 'Enter AR';
+
+        // If the canvas color format is different than the XR one, rebuild the
+        // pipeline again upon switching back.
+        if (colorFormat != navigator.gpu.getPreferredCanvasFormat()) {
+          colorFormat = navigator.gpu.getPreferredCanvasFormat();
+          await initWebGPU();
+        }
+
+        requestAnimationFrame(onFrame);
+      }
+
+      // Called every time the XRSession requests that a new frame be drawn.
+      function onXRFrame(time, frame) {
+        let session = frame.session;
+
+        // Inform the session that we're ready for the next frame.
+        session.requestAnimationFrame(onXRFrame);
+
+        // Get the XRDevice pose relative to the reference space we created
+        // earlier.
+        let pose = frame.getViewerPose(xrRefSpace);
+
+        // Getting the pose may fail if, for example, tracking is lost. So we
+        // have to check to make sure that we got a valid pose before attempting
+        // to render with it. If not in this case we'll just leave the
+        // framebuffer cleared, so tracking loss means the scene will simply
+        // disappear.
+        if (pose) {
+
+          // If we do have a valid pose, begin recording GPU commands.
+          const commandEncoder = gpuDevice.createCommandEncoder();
+
+          // First loop through each view and write it's projection and view
+          // matrices into the uniform buffer.
+          for (let viewIndex = 0; viewIndex < pose.views.length; ++viewIndex) {
+            const view = pose.views[viewIndex];
+            const offset = UNIFORM_FLOATS_PER_VIEW * viewIndex;
+            gpuUniformArray.set(view.projectionMatrix, offset);
+            gpuUniformArray.set(view.transform.inverse.matrix, offset + 16);
+          }
+          gpuDevice.queue.writeBuffer(gpuUniformBuffer, 0, gpuUniformArray);
+
+          // Now loop through each of the views and draw into the corresponding
+          // sub image of the projection layer.
+          for (let viewIndex = 0; viewIndex < pose.views.length; ++viewIndex) {
+            const view = pose.views[viewIndex];
+            let subImage = xrGpuBinding.getViewSubImage(projectionLayer, view);
+
+            // Start a render pass which uses the textures of the view's sub
+            // image as render targets.
+            const renderPass = commandEncoder.beginRenderPass({
+                colorAttachments: [{
+                  view: subImage.colorTexture.createView(subImage.getViewDescriptor()),
+                  // Clear the color texture to a solid color.
+                  loadOp: 'clear',
+                  storeOp: 'store',
+                  // Clear the canvas to transparent black so the user's environment
+                  // shows through.
+                  clearValue: [0.0, 0.0, 0.0, 0.0],
+                }],
+                depthStencilAttachment: {
+                  view: subImage.depthStencilTexture.createView(subImage.getViewDescriptor()),
+                  // Clear the depth texture
+                  depthLoadOp: 'clear',
+                  depthStoreOp: 'store',
+                  depthClearValue: 1.0,
+                }
+              });
+
+            let vp = subImage.viewport;
+            renderPass.setViewport(vp.x, vp.y, vp.width, vp.height, 0.0, 1.0);
+
+            drawScene(renderPass, viewIndex);
+
+            renderPass.end();
+          }
+
+          // Submit the rendering commands to the GPU.
+          gpuDevice.queue.submit([commandEncoder.finish()]);
+        }
+      }
+
+      // Does a standard render to the canvas
+      function onFrame(time) {
+        // If a session has started since the last frame don't request a new one.
+        if (!xrSession) {
+          requestAnimationFrame(onFrame);
+        }
+
+        const commandEncoder = gpuDevice.createCommandEncoder();
+
+        // Start a render pass which uses the textures of the view's sub
+        // image as render targets.
+        const renderPass = commandEncoder.beginRenderPass({
+          colorAttachments: [{
+            view: gpuContext.getCurrentTexture().createView(),
+            // Clear the color texture to a solid color.
+            loadOp: 'clear',
+            storeOp: 'store',
+            clearValue: [0.1, 0.1, 0.4, 1.0],
+          }],
+          depthStencilAttachment: {
+            view: gpuDepthTexture.createView(),
+            // Clear the depth texture
+            depthLoadOp: 'clear',
+            depthStoreOp: 'store',
+            depthClearValue: 1.0,
+          }
+        });
+
+        drawScene(renderPass);
+
+        renderPass.end();
+
+        // Submit the rendering commands to the GPU.
+        gpuDevice.queue.submit([commandEncoder.finish()]);
+      }
+
+      function drawScene(renderPass, viewIndex = 0) {
+        // Renders the scene using the uniforms saved for view[viewIndex], which
+        // are accessible in gpuBindGroups[viewIndex].
+        renderPass.setPipeline(gpuPipeline);
+        renderPass.setBindGroup(0, gpuBindGroups[viewIndex]);
+        // Draw 5 instances of the triangle so that our scene has some depth
+        renderPass.draw(3, 5);
+      }
+
+      // Start the XR application.
+      initXR();
