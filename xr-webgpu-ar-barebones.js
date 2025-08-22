@@ -404,6 +404,21 @@
             renderPass.end();
           }
 
+          // FPS overlay
+          {
+            const now = performance.now();
+            window.__frames = (window.__frames || 0) + 1;
+            if (!window.__fps_t0) window.__fps_t0 = now;
+            const dt = now - window.__fps_t0;
+            if (dt >= 500) {
+              const fps = Math.round((window.__frames * 1000) / dt);
+              const el = document.getElementById('fps');
+              if (el) el.textContent = 'FPS: ' + fps;
+              window.__frames = 0;
+              window.__fps_t0 = now;
+            }
+          }
+
           // Submit the rendering commands to the GPU.
           gpuDevice.queue.submit([commandEncoder.finish()]);
         }
