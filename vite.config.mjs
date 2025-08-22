@@ -6,6 +6,8 @@ export default defineConfig({
   plugins: [react(), mkcert()],
   server: { host: true, https: true },
   preview: { host: true, https: true },
+  // GitHub Pages subpath
+  base: '/webxr-hit-test/',
   optimizeDeps: {
     include: [
       "react",
