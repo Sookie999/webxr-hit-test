@@ -1,3 +1,6 @@
+      // - WebXR(AR) 세션을 시작하고, WebGPU로 왼/오른쪽 눈(최대 2뷰)에 그려서 디스플레이합니다.
+      // - 프레임마다 각 뷰의 투영/뷰 행렬을 uniform 버퍼에 써넣고, 히트테스트 포즈가 있으면 모델 행렬로 배치합니다.
+      
       // that WebXR will never provide more than two views.
       const MAX_VIEWS = 2;
       // We have two matrices per view, which is only 32 floats, but we're going
@@ -6,6 +9,7 @@
       const UNIFORM_FLOATS_PER_VIEW = 64; // projection(16) + view(16) + model(16) + padding
 
       // A simple shader that draws a single triangle
+      // - WGSL 셰이더: 카메라(투영/뷰/모델) uniform을 받아 작은 삼각형을 다중 인스턴스로 렌더합니다.
       const SHADER_SRC = `
         struct Camera {
           projection: mat4x4f,
@@ -52,11 +56,13 @@
       `;
 
       // XR globals.
+      // - XR 세션과 레퍼런스 스페이스를 담는 전역 변수들입니다.
       let xrButton = document.getElementById('xr-button');
       let xrSession = null;
       let xrRefSpace = null;
 
       // WebGPU scene globals.
+      // - WebGPU 디바이스/컨텍스트, uniform 버퍼/바인딩, 파이프라인 등을 담습니다.
       let gpuDevice = null;
       let gpuContext = null;
       let gpuUniformBuffer = null;
@@ -71,6 +77,7 @@
 
 
       // WebXR/WebGPU interop globals.
+      // - XRGPUBinding과 ProjectionLayer는 WebXR과 WebGPU를 직접 연결합니다.
       let xrGpuBinding = null;
       let projectionLayer = null;
 
@@ -104,6 +111,7 @@
 
       // Checks to see if WebXR and WebGPU is available and, if so, requests an
       // tests to ensure it supports the desired session type.
+      // - 기능 지원(웹XR/웹GPU/XRGPUBinding) 확인 → AR 지원 시 버튼 활성화 → WebGPU 준비
       async function initXR() {
         // Is WebXR, WebGPU, and WebXR/WebGPU interop available on this UA?
         if (!navigator.xr) {
@@ -139,6 +147,7 @@
       }
 
       // Initializes WebGPU resources
+      // - 어댑터/디바이스 생성 → 컨텍스트 구성 → depth 텍스처/유니폼 버퍼/바인딩 생성 → 파이프라인 준비
       async function initWebGPU() {
         if (!gpuDevice) {
           // Create a WebGPU adapter and device to render with, initialized to be
@@ -164,6 +173,7 @@
           });
 
           // Allocate a uniform buffer with enough space for two uniforms per-view
+          // - 뷰마다 projection(16) + view(16) + model(16) = 48 floats 사용, 정렬 때문에 64 floats 할당
           gpuUniformBuffer = gpuDevice.createBuffer({
             size: Float32Array.BYTES_PER_ELEMENT * UNIFORM_FLOATS_PER_VIEW * MAX_VIEWS,
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
@@ -171,6 +181,7 @@
 
           // Set the uniform buffer to contain valid matrices initially so
           // that we can see something.
+          // - 초기 모델 행렬(단위행렬)과 투영 행렬을 채워 화면에 보이도록 합니다.
           let mat = [
             1, 0, 0, 0,
             0, 1, 0, 0,
@@ -186,6 +197,7 @@
           gpuDevice.queue.writeBuffer(gpuUniformBuffer, 0, gpuUniformArray);
 
           // Create a bind group layout for the uniforms
+          // - 카메라 uniform 버퍼를 셰이더 @group(0) @binding(0)로 연결하기 위한 레이아웃
           gpuBindGroupLayout = gpuDevice.createBindGroupLayout({
             entries: [{
               binding: 0,
@@ -195,6 +207,7 @@
           });
 
           // Create a bind group for each potential view
+          // - 왼/오른쪽 눈 각각에 대응하는 바인드 그룹을 만들어, uniform 오프셋으로 구분합니다.
           for (let i = 0; i < MAX_VIEWS; ++i) {
             gpuBindGroups.push(gpuDevice.createBindGroup({
               layout: gpuBindGroupLayout,
@@ -234,6 +247,7 @@
 
       // Called when the user clicks the button to enter XR. If we don't have a
       // session we'll request one, and if we do have a session we'll end it.
+      // - 버튼 클릭 시 AR 세션을 시작하거나, 이미 시작된 경우 종료합니다.
       async function onButtonClicked() {
         if (!xrSession) {
           navigator.xr.requestSession('immersive-ar', {
@@ -246,6 +260,7 @@
 
       // Called when we've successfully acquired a XRSession. In response we
       // will set up the necessary session state and kick off the frame loop.
+      // - XRGPUBinding 생성 → ProjectionLayer 구성 → layers에 등록 → reference space 준비 → 프레임 루프 시작
       async function onSessionStarted(session) {
         xrSession = session;
         xrButton.textContent = 'Exit AR';
@@ -280,6 +295,7 @@
         session.requestReferenceSpace('local').then(async (refSpace) => {
           xrRefSpace = refSpace;
           try {
+            // 히트테스트 소스(viewer / transient)를 준비해서 바닥 등의 포즈를 프레임마다 얻습니다.
             const viewer = await session.requestReferenceSpace('viewer');
             if (session.requestHitTestSource) {
               window.__viewerHit = await session.requestHitTestSource({ space: viewer });
@@ -298,6 +314,7 @@
       // session.end() or when the UA has ended the session for any reason.
       // At this point the session object is no longer usable and should be
       // discarded.
+      // - 세션 종료 시 상태 초기화하고, 캔버스 렌더링 루프로 복귀합니다.
       async function onSessionEnded(event) {
         xrSession = null;
         xrGpuBinding = null;
@@ -314,6 +331,8 @@
       }
 
       // Called every time the XRSession requests that a new frame be drawn.
+      // - XR 프레임 루프: 각 뷰 행렬을 uniform에 기록 → 서브 이미지로 렌더 패스 시작 →
+      //   히트 포즈가 있으면 모델 행렬 갱신 후 drawScene → 커맨드 제출 → FPS 갱신
       function onXRFrame(time, frame) {
         let session = frame.session;
 
@@ -347,6 +366,7 @@
           } catch {}
 
           // If we do have a valid pose, begin recording GPU commands.
+          // - 커맨드 인코더 생성 후, 각 뷰의 투영/뷰 행렬을 uniform 버퍼에 채웁니다.
           const commandEncoder = gpuDevice.createCommandEncoder();
 
           // First loop through each view and write it's projection and view
@@ -361,6 +381,7 @@
 
           // Now loop through each of the views and draw into the corresponding
           // sub image of the projection layer.
+          // - 뷰별 서브이미지 텍스처로 렌더 패스를 열고, 투명 클리어 후, 뷰포트 설정, 드로우합니다.
           for (let viewIndex = 0; viewIndex < pose.views.length; ++viewIndex) {
             const view = pose.views[viewIndex];
             let subImage = xrGpuBinding.getViewSubImage(projectionLayer, view);
@@ -390,6 +411,7 @@
             renderPass.setViewport(vp.x, vp.y, vp.width, vp.height, 0.0, 1.0);
 
             // Draw triangle at viewer-hit pose if available
+            // - viewer 히트 포즈가 있으면 해당 포즈 행렬을 모델에 써서 그 위치에 배치합니다.
             if (window.__lastViewerPose) {
               const mo = UNIFORM_FLOATS_PER_VIEW * viewIndex + 32;
               gpuUniformArray.set(window.__lastViewerPose.transform.matrix, mo);
@@ -404,6 +426,7 @@
           }
 
           // FPS overlay
+          // - 0.5초마다 프레임 수를 세어 우상단 오버레이 텍스트를 갱신합니다.
           {
             const now = performance.now();
             window.__frames = (window.__frames || 0) + 1;
@@ -424,6 +447,7 @@
       }
 
       // Does a standard render to the canvas
+      // - XR 세션이 아닐 때(일반 캔버스)에도 동일 파이프라인으로 화면 확인용 렌더를 수행합니다.
       function onFrame(time) {
         // If a session has started since the last frame don't request a new one.
         if (!xrSession) {
@@ -465,8 +489,10 @@
         renderPass.setPipeline(gpuPipeline);
         renderPass.setBindGroup(0, gpuBindGroups[viewIndex]);
         // Draw many instances to stress performance
+        // - 삼각형(버텍스 3개)을 1024번 인스턴싱해서 성능을 체감할 수 있게 합니다.
         renderPass.draw(3, 1024);
       }
 
       // Start the XR application.
+      // - 초기화 시작: 지원 확인 → WebGPU 준비 → 일반 캔버스 프레임 루프 시작
       initXR();
