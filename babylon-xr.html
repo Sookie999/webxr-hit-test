@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Babylon WebXR + WebGPU (Experimental)</title>
+<style>body,html{margin:0;height:100%;background:#000;color:#eee;font-family:sans-serif;}#overlay{position:fixed;left:0;right:0;bottom:0;padding:12px 16px;background:linear-gradient(180deg,rgba(0,0,0,0) 0%,rgba(0,0,0,.55) 35%,rgba(0,0,0,.8) 100%);}#log{position:fixed;top:8px;left:8px;font-size:12px;}</style>
+</head>
+<body>
+<div id="overlay">실험 기능: WebGPU가 실패하면 자동으로 WebGL로 폴백합니다.</div>
+<div id="log"></div>
+<canvas id="c"></canvas>
+<script type="module" src="/babylon-xr.js"></script>
+</body>
+</html>
