@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
+<title>Experimental WebXR + WebGPU Binding</title>
+<link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+<main style="padding:12px;color:#ddd;line-height:1.6">
+  <h1>Experimental: WebXR + WebGPU Binding</h1>
+  <p>Chrome 최신 + (필요 시) WebXR Incubations / WebXR Layers 플래그 활성화가 필요할 수 있습니다.</p>
+  <div style="margin:8px 0">
+    <button id="start">Start AR</button>
+    <button id="start-vr">Start VR</button>
+    <span id="status" style="margin-left:12px;color:#bbb">Status: idle</span>
+  </div>
+  <pre id="log" style="white-space:pre-wrap"></pre>
+</main>
+<script type="module" src="/xr-webgpu-binding.js"></script>
+</body>
+</html>
