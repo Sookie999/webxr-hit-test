@@ -8,7 +8,7 @@
     "dev:https": "vite --host",
     "build": "vite build",
     "preview": "vite preview --host",
-    "deploy": "vite build && gh-pages -d dist"
+    "deploy": "vite build && gh-pages -d dist -b gh-pages --add -m \"deploy\""
   },
   "dependencies": {
     "@babylonjs/core": "^8.24.0",
