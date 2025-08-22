@@ -23,10 +23,11 @@
         @vertex
         fn vertexMain(@builtin(vertex_index) vert_index: u32,
                       @builtin(instance_index) instance: u32) -> VertexOut {
+          // Smaller triangle (reduced by ~10x)
           var pos = array<vec4f, 3>(
-            vec4f(0.0, 0.25, -0.5, 1),
-            vec4f(-0.25, -0.25, -0.5, 1),
-            vec4f(0.25, -0.25, -0.5, 1)
+            vec4f(0.0, 0.025, -0.5, 1),
+            vec4f(-0.025, -0.025, -0.5, 1),
+            vec4f(0.025, -0.025, -0.5, 1)
           );
 
           var color = array<vec4f, 3>(
@@ -35,8 +36,11 @@
             vec4f(0, 0, 1, 1)
           );
 
-          // Give each instance a small offset to help with the sense of depth.
-          let instancePos = pos[vert_index] + vec4f(0, 0, f32(instance) * -0.1, 0);
+          // Give each instance an offset. Spread across a shallow grid in front of the camera.
+          let ix = f32(instance % 32u);
+          let iy = f32((instance / 32u) % 32u);
+          let offset = vec4f((ix - 16.0) * 0.01, (iy - 16.0) * 0.01, -0.5 - f32(instance) * 0.0005, 0);
+          let instancePos = pos[vert_index] + offset;
           let posOut = camera.projection * camera.view * camera.model * instancePos;
 
           return VertexOut(posOut, color[vert_index]);
@@ -446,8 +450,8 @@
         // are accessible in gpuBindGroups[viewIndex].
         renderPass.setPipeline(gpuPipeline);
         renderPass.setBindGroup(0, gpuBindGroups[viewIndex]);
-        // Draw 5 instances of the triangle so that our scene has some depth
-        renderPass.draw(3, 5);
+        // Draw many instances to stress performance
+        renderPass.draw(3, 1024);
       }
 
       // Start the XR application.
