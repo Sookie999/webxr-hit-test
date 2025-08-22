@@ -4,13 +4,14 @@
       // We have two matrices per view, which is only 32 floats, but we're going
       // to allocate 64 of them because uniform buffers bindings must be aligned
       // to 256-bytes.
-      const UNIFORM_FLOATS_PER_VIEW = 64;
+      const UNIFORM_FLOATS_PER_VIEW = 64; // projection(16) + view(16) + model(16) + padding
 
       // A simple shader that draws a single triangle
       const SHADER_SRC = `
         struct Camera {
           projection: mat4x4f,
           view: mat4x4f,
+          model: mat4x4f,
         }
         @group(0) @binding(0) var<uniform> camera: Camera;
 
@@ -36,7 +37,7 @@
 
           // Give each instance a small offset to help with the sense of depth.
           let instancePos = pos[vert_index] + vec4f(0, 0, f32(instance) * -0.1, 0);
-          let posOut = camera.projection * camera.view * instancePos;
+          let posOut = camera.projection * camera.view * camera.model * instancePos;
 
           return VertexOut(posOut, color[vert_index]);
         }
@@ -174,6 +175,7 @@
             0, 0, 0, 1
           ];
           gpuUniformArray.set(mat, 16);
+          gpuUniformArray.set(mat, 32);
 
           perspectiveZO(mat, Math.PI * 0.5, webgpu_canvas.offsetWidth / webgpu_canvas.offsetHeight, 0.1);
           gpuUniformArray.set(mat, 0);
@@ -272,8 +274,17 @@
         // Get a reference space, which is required for querying poses. In this
         // case an 'local' reference space means that all poses will be relative
         // to the location where the XR device was first detected.
-        session.requestReferenceSpace('local').then((refSpace) => {
+        session.requestReferenceSpace('local').then(async (refSpace) => {
           xrRefSpace = refSpace;
+          try {
+            const viewer = await session.requestReferenceSpace('viewer');
+            if (session.requestHitTestSource) {
+              window.__viewerHit = await session.requestHitTestSource({ space: viewer });
+            }
+            if (session.requestHitTestSourceForTransientInput) {
+              window.__transientHit = await session.requestHitTestSourceForTransientInput({ profile: 'generic-touchscreen' });
+            }
+          } catch {}
 
           // Inform the session that we're ready to begin drawing.
           session.requestAnimationFrame(onXRFrame);
@@ -316,6 +327,21 @@
         // framebuffer cleared, so tracking loss means the scene will simply
         // disappear.
         if (pose) {
+          // Update hits (viewer + transient)
+          try {
+            if (window.__viewerHit) {
+              const hits = frame.getHitTestResults(window.__viewerHit);
+              if (hits && hits.length > 0) {
+                window.__lastViewerPose = hits[0].getPose(xrRefSpace);
+              }
+            }
+            if (window.__transientHit && frame.getHitTestResultsForTransientInput) {
+              const tr = frame.getHitTestResultsForTransientInput(window.__transientHit);
+              if (tr && tr.length > 0 && tr[0].results && tr[0].results.length > 0) {
+                window.__lastTransient = tr[0].results[0];
+              }
+            }
+          } catch {}
 
           // If we do have a valid pose, begin recording GPU commands.
           const commandEncoder = gpuDevice.createCommandEncoder();
@@ -360,7 +386,16 @@
             let vp = subImage.viewport;
             renderPass.setViewport(vp.x, vp.y, vp.width, vp.height, 0.0, 1.0);
 
-            drawScene(renderPass, viewIndex);
+            // Draw triangle at viewer-hit pose if available
+            if (window.__lastViewerPose) {
+              const mo = UNIFORM_FLOATS_PER_VIEW * viewIndex + 32;
+              gpuUniformArray.set(window.__lastViewerPose.transform.matrix, mo);
+              gpuDevice.queue.writeBuffer(gpuUniformBuffer, 0, gpuUniformArray);
+              drawScene(renderPass, viewIndex);
+            } else {
+              // fallback at default model (identity)
+              drawScene(renderPass, viewIndex);
+            }
 
             renderPass.end();
           }
