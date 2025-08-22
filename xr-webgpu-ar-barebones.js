@@ -1,4 +1,3 @@
- // Because we are not using the 'secondary-views' feature we can be sure
       // that WebXR will never provide more than two views.
       const MAX_VIEWS = 2;
       // We have two matrices per view, which is only 32 floats, but we're going
