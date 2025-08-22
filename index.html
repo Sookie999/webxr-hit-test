@@ -10,14 +10,14 @@
 .info { position: fixed; top: 10px; right: 10px; color:#ccc; font-size: 12px; }
 body { background:#000; }
 </style>
-  <link rel="stylesheet" crossorigin href="/assets/index-BSOHOIxP.css">
+  <link rel="stylesheet" crossorigin href="/webxr-hit-test/assets/index-BSOHOIxP.css">
 </head>
 <body>
 <main style="padding:12px;line-height:1.6">
   <h1 style="color:#ddd">WebXR + WebGPU AR Barebones</h1>
   <p style="color:#bbb">실험 페이지를 루트로 노출합니다.</p>
   <div style="margin:8px 0">
-    <button onclick="location.href='/xr-webgpu-ar-barebones.html'">Open AR Barebones</button>
+    <button onclick="location.href=window.location.pathname.replace(/\/[^/]*$/, '/') + 'xr-webgpu-ar-barebones.html'">Open AR Barebones</button>
   </div>
 </main>
 </body>
