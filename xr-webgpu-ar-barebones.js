@@ -16,11 +16,11 @@ async function start(){
     const device = await adapter.requestDevice();
     log('GPU device acquired');
 
-    // Match the official sample API surface: require 'webgpu'; add 'hit-test' optionally
+    // Require webgpu+layers to maximize chances of primary layer exposure; add hit-test/anchors optionally
     let session;
     try {
-      session = await navigator.xr.requestSession('immersive-ar', { requiredFeatures:['webgpu'], optionalFeatures:['hit-test'] });
-      statusEl.textContent = 'Status: AR session started (webgpu)';
+      session = await navigator.xr.requestSession('immersive-ar', { requiredFeatures:['webgpu','layers'], optionalFeatures:['hit-test','anchors'] });
+      statusEl.textContent = 'Status: AR session started (webgpu+layers)';
     } catch (e) {
       log('requestSession failed:', e.message || e);
       return;
@@ -149,10 +149,21 @@ async function start(){
       if (!pose) { session.requestAnimationFrame(render); return; }
       try {
         if (!layer) {
+          // Try to pick up implicit primary layer
           layer = getPrimaryLayer();
-          if (layer) {
-            statusEl.textContent = 'Status: implicit WebGPU layer acquired';
+          if (!layer) {
+            // As a fallback, if constructors are exposed, create a layer and set renderState.layers
+            const Ctor = globalThis.XRWebGPUTieredLayer || globalThis.XRWebGPULayer;
+            if (Ctor) {
+              try {
+                layer = new Ctor(session, device);
+                if (layer) {
+                  await session.updateRenderState({ layers: [layer] });
+                }
+              } catch {}
+            }
           }
+          if (layer) statusEl.textContent = 'Status: implicit WebGPU layer acquired';
         }
         if (layer && (layer.getViewSubImage || layer.getViewTexture)) {
           const encoder = device.createCommandEncoder();
